@@ -1,0 +1,6 @@
+[submodule "extern/parlaylib"]
+	path = extern/parlaylib
+	url = https://github.com/cmuparlay/parlaylib.git
+[submodule "extern/x86-smid-sort"]
+	path = extern/x86-smid-sort
+	url = https://github.com/numpy/x86-simd-sort.git
