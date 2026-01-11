@@ -195,7 +195,31 @@ void count_tile_simple(const T* begin, const T* end,
     // 剩下的给最后一个桶
     counts[num_buckets-1] = (end - curr);
 }
+// 全局 Flush Buffer
+// 使用 parlay::sequence 方便并行操作，但需要注意它可能不保证 64 字节对齐
+// 这里我们主要为了挤占 Cache，对齐不是 flush 的硬性要求
+parlay::sequence<char> g_dummy_buffer;
+const size_t FLUSH_SIZE_BYTES = 2UL * 1024 * 1024 * 1024; 
+// ==========================================
+// 辅助函数：Flush Cache
+// ==========================================
+void init_flush_buffer() {
+    std::cout << "[Init] Allocating " << FLUSH_SIZE_BYTES / 1024 / 1024 << " MB for cache flushing..." << std::endl;
+    g_dummy_buffer = parlay::sequence<char>(FLUSH_SIZE_BYTES, 0);
+}
 
+void flush_cache() {
+    // 使用并行写入，强制所有核心参与 Cache 驱逐
+    // 写入操作比读取更能有效地触发 Cache 替换策略 (RFO)
+    parlay::parallel_for(0, g_dummy_buffer.size() / 64, [&](size_t i) {
+        // 写入每个 Cache Line 的第一个字节
+        // volatile 阻止编译器优化掉“无用”的写入
+        volatile char* ptr = &g_dummy_buffer[i * 64];
+        *ptr = (char)i;
+    });
+    // 内存屏障，防止乱序执行
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+}
 int main(int argc, char* argv[]) {
     // 默认参数
     size_t n = 1000000000UL;      // 10亿
@@ -221,7 +245,7 @@ int main(int argc, char* argv[]) {
     // ----------------------------------------------------------------
     std::cout << "[Setup] Generating data..." << std::endl;
     auto input = generate_data(n, dist);
-    
+    init_flush_buffer();
     // 预分配输出数组 (NUMA First Touch)
     parlay::sequence<T> output(n + 4096, 0); // Padding for safety
 
@@ -301,7 +325,7 @@ int main(int argc, char* argv[]) {
     // 每个线程需要一个局部的指针缓存数组，避免 false sharing
     // 我们的 scatter 函数需要 OutIterator* bucket_ptrs
     // 我们在 parallel_for 内部从 block_write_ptrs拷贝过来
-    
+    flush_cache();
     auto start = std::chrono::high_resolution_clock::now();
 
     parlay::parallel_for(0, num_blocks, [&](size_t i) {
