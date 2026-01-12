@@ -14,6 +14,10 @@
 #include "parlay/slice.h"
 #include "parlay/utilities.h"
 
+#include "perf_ctl.hpp"
+#include "flush_range_clflushopt.h"
+
+
 // 引入你的核心 Scatter 函数 (为了保持独立性，我直接粘贴在这里，
 // 实际工程中你可以 include 你的头文件)
 // ============================================================
@@ -220,149 +224,195 @@ void flush_cache() {
     // 内存屏障，防止乱序执行
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
+void flush_cache_readonly() {
+  const size_t nlines = g_dummy_buffer.size() / 64;
+
+  const size_t P = (size_t)parlay::num_workers();
+  std::vector<uint64_t> tls(P, 0);
+
+  parlay::parallel_for(0, nlines, [&](size_t i) {
+    size_t wid = (size_t)parlay::worker_id();
+    // 读每条 cache line 的一个字节，累加到线程局部，防止被优化掉
+    tls[wid] += (unsigned char)g_dummy_buffer[i * 64];
+  });
+
+  // 防止编译器把 tls 优化掉
+  uint64_t sink = 0;
+  for (auto v : tls) sink ^= v;
+  asm volatile("" :: "r"(sink) : "memory");
+}
+
+
+// ------------------------------------------------------------
+// Helpers for correct int32 pivots covering full signed range
+// ------------------------------------------------------------
+static inline uint32_t to_u32_ordered(int32_t x) {
+  return (uint32_t)x ^ 0x80000000u;
+}
+static inline int32_t to_i32_ordered(uint32_t u) {
+  return (int32_t)(u ^ 0x80000000u);
+}
+
+// ---- You already have these somewhere ----
+// using T = int; (or int32_t)
+// enum DistType { DIST_UNIFORM, DIST_SORTED, DIST_REVERSE };
+// parlay::sequence<T> generate_data(size_t n, DistType dist);
+// void init_flush_buffer();
+// void flush_cache();
+// void count_tile_simple(T* begin, T* end, T* pivots, size_t num_buckets, size_t* out_counts);
+// template <typename InIterator, typename PivotIterator, typename OutIterator>
+// void scatter_tile_merge_galloping_aligned(parlay::slice<InIterator, InIterator> tile,
+//                                           parlay::slice<PivotIterator, PivotIterator> pivots,
+//                                           OutIterator* bucket_ptrs,
+//                                           size_t num_buckets);
+
 int main(int argc, char* argv[]) {
-    // 默认参数
-    size_t n = 1000000000UL;      // 10亿
-    size_t num_buckets = 256;     // 256 桶
-    size_t block_size = 256 * 1024; // 256K (1MB)
-    DistType dist = DIST_UNIFORM;
-    std::string dist_name = "uniform";
+  // 默认参数
+  size_t n = 1000000000UL;         // 10亿
+  size_t num_buckets = 256;        // 256 桶
+  size_t block_size = 256 * 1024;  // 256K elements (对 int32 是 1MB)
+  DistType dist = DIST_UNIFORM;
+  std::string dist_name = "uniform";
 
-    if (argc > 1) n = std::stoull(argv[1]);
-    if (argc > 2) num_buckets = std::stoull(argv[2]);
-    if (argc > 3) block_size = std::stoull(argv[3]);
-    if (argc > 4) {
-        dist_name = argv[4];
-        if (dist_name == "sorted") dist = DIST_SORTED;
-        else if (dist_name == "reverse") dist = DIST_REVERSE;
+  if (argc > 1) n = std::stoull(argv[1]);
+  if (argc > 2) num_buckets = std::stoull(argv[2]);
+  if (argc > 3) block_size = std::stoull(argv[3]);
+  if (argc > 4) {
+    dist_name = argv[4];
+    if (dist_name == "sorted") dist = DIST_SORTED;
+    else if (dist_name == "reverse") dist = DIST_REVERSE;
+  }
+
+  std::cout << "Config: N=" << n << ", Buckets=" << num_buckets
+            << ", BlockSize=" << block_size << ", Dist=" << dist_name << "\n";
+
+  // ----------------------------------------------------------------
+  // Setup Phase (Not Timed)
+  // ----------------------------------------------------------------
+  std::cout << "[Setup] Generating data...\n";
+  auto input = generate_data(n, dist);
+
+  init_flush_buffer();
+
+  // 预分配输出数组
+  parlay::sequence<T> output(n + 4096, 0);
+
+  // 强制 first-touch（计时外）：并行 touch output，避免 NUMA 偏置
+  std::cout << "[Setup] First-touch output...\n";
+  parlay::parallel_for(0, output.size(), [&](size_t i) {
+    output[i] = 0;
+  }, 4096);
+
+  // 生成 pivots
+  parlay::sequence<T> pivots(num_buckets - 1);
+  if (dist == DIST_UNIFORM) {
+    // 让 pivots 覆盖 int32 全域且单调：在 ordered uint32 空间均匀切分，再映射回 int32
+    // step = 2^32 / num_buckets
+    uint64_t step = (uint64_t(1) << 32) / (uint64_t)num_buckets;
+    for (size_t i = 0; i < num_buckets - 1; ++i) {
+      uint32_t u = (uint32_t)((uint64_t)(i + 1) * step);
+      int32_t p = to_i32_ordered(u);
+      pivots[i] = (T)p;
     }
-
-    std::cout << "Config: N=" << n << ", Buckets=" << num_buckets 
-              << ", BlockSize=" << block_size << ", Dist=" << dist_name << std::endl;
-
-    // ----------------------------------------------------------------
-    // Setup Phase (Not Timed)
-    // ----------------------------------------------------------------
-    std::cout << "[Setup] Generating data..." << std::endl;
-    auto input = generate_data(n, dist);
-    init_flush_buffer();
-    // 预分配输出数组 (NUMA First Touch)
-    parlay::sequence<T> output(n + 4096, 0); // Padding for safety
-
-    // 生成 Pivots (均匀采样)
-    // 注意：对于 Uniform 分布，均匀采样 Pivot 是合理的。
-    // 对于 Sorted/Reverse 分布，我们直接在值域上均匀切分。
-    parlay::sequence<T> pivots(num_buckets - 1);
-    if (dist == DIST_UNIFORM) {
-        // 对于随机数，我们在 unsigned 空间均匀切分
-        size_t step = (size_t)(-1) / num_buckets; // unsigned max / buckets
-        for(size_t i=0; i<num_buckets-1; ++i) {
-            pivots[i] = (T)((i + 1) * step);
-        }
-    } else {
-        // 对于 Sorted，我们在实际 Range 上切分
-        long long min_val = std::numeric_limits<int>::min();
-        long long range = n;
-        double step = (double)range / num_buckets;
-        for(size_t i=0; i<num_buckets-1; ++i) {
-            pivots[i] = (T)(min_val + (long long)((i+1) * step));
-        }
+  } else {
+    // sorted/reverse：你原逻辑（按值域/范围切分）
+    long long min_val = std::numeric_limits<int>::min();
+    long long range = (long long)n;
+    double step = (double)range / (double)num_buckets;
+    for (size_t i = 0; i < num_buckets - 1; ++i) {
+      pivots[i] = (T)(min_val + (long long)((i + 1) * step));
     }
+  }
 
-    // Phase 1: Sort each Block (模拟 Sample Sort 的第一步)
-    std::cout << "[Setup] Sorting blocks..." << std::endl;
-    size_t num_blocks = (n + block_size - 1) / block_size;
-    parlay::parallel_for(0, num_blocks, [&](size_t i) {
-        size_t start = i * block_size;
-        size_t end = std::min(start + block_size, n);
-        std::sort(input.begin() + start, input.begin() + end);
-    });
+  // Phase 1: Sort each Block
+  std::cout << "[Setup] Sorting blocks...\n";
+  size_t num_blocks = (n + block_size - 1) / block_size;
+  parlay::parallel_for(0, num_blocks, [&](size_t i) {
+    size_t s = i * block_size;
+    size_t e = std::min(s + block_size, n);
+    std::sort(input.begin() + s, input.begin() + e);
+  });
 
-    // Phase 1.5: Oracle Counts (计算所有写指针)
-    // 为了 benchmark scatter，我们需要知道每个 block 往每个 bucket 写到全局数组的哪个位置
-    std::cout << "[Setup] Calculating offsets (Oracle)..." << std::endl;
-    
-    // 存储每个 Block 每个 Bucket 的 Count
-    // 大小: num_blocks * num_buckets
-    parlay::sequence<size_t> block_bucket_counts(num_blocks * num_buckets);
-    
-    parlay::parallel_for(0, num_blocks, [&](size_t i) {
-        size_t start = i * block_size;
-        size_t end = std::min(start + block_size, n);
-        count_tile_simple(input.begin() + start, input.begin() + end, 
-                          pivots.begin(), num_buckets, 
-                          &block_bucket_counts[i * num_buckets]);
-    });
+  // Phase 1.5: Oracle Counts
+  std::cout << "[Setup] Calculating offsets (Oracle)...\n";
 
-    // 存储每个 Block 每个 Bucket 的 Write Offset (Transpose 后的全局偏移)
-    parlay::sequence<T*> block_write_ptrs(num_blocks * num_buckets);
-    
-    // 计算前缀和 (Sequential for buckets, Parallel logic is complex, keep simple here)
-    // 真正的 Sample Sort 会用 parallel scan，这里我们简单做
-    // 按 Bucket 优先遍历 (Transpose)
-    std::vector<size_t> global_bucket_tails(num_buckets, 0);
-    
-    // 这是一个串行的 Setup，可能会慢，但保证正确性
-    // 对于 10亿数据，这个过程也就几秒
-    for(size_t b=0; b<num_buckets; ++b) {
-        size_t current_offset = 0;
-        // 累加所有前面的桶的总大小 (前一个桶的结束位置)
-        if (b > 0) current_offset = global_bucket_tails[b-1];
-        
-        for(size_t i=0; i<num_blocks; ++i) {
-            block_write_ptrs[i * num_buckets + b] = output.begin() + current_offset;
-            size_t count = block_bucket_counts[i * num_buckets + b];
-            current_offset += count;
-        }
-        global_bucket_tails[b] = current_offset;
+  parlay::sequence<size_t> block_bucket_counts(num_blocks * num_buckets);
+
+  parlay::parallel_for(0, num_blocks, [&](size_t i) {
+    size_t s = i * block_size;
+    size_t e = std::min(s + block_size, n);
+    count_tile_simple(input.begin() + s, input.begin() + e,
+                      pivots.begin(), num_buckets,
+                      &block_bucket_counts[i * num_buckets]);
+  });
+
+  parlay::sequence<T*> block_write_ptrs(num_blocks * num_buckets);
+
+  std::vector<size_t> global_bucket_tails(num_buckets, 0);
+  for (size_t b = 0; b < num_buckets; ++b) {
+    size_t current_offset = (b > 0) ? global_bucket_tails[b - 1] : 0;
+    for (size_t i = 0; i < num_blocks; ++i) {
+      block_write_ptrs[i * num_buckets + b] = output.begin() + current_offset;
+      size_t count = block_bucket_counts[i * num_buckets + b];
+      current_offset += count;
     }
+    global_bucket_tails[b] = current_offset;
+  }
 
-    // ----------------------------------------------------------------
-    // Benchmark Phase (Timed)
-    // ----------------------------------------------------------------
-    std::cout << "[Benchmark] Running Scatter Phase..." << std::endl;
-    
-    // 每个线程需要一个局部的指针缓存数组，避免 false sharing
-    // 我们的 scatter 函数需要 OutIterator* bucket_ptrs
-    // 我们在 parallel_for 内部从 block_write_ptrs拷贝过来
-    flush_cache();
-    auto start = std::chrono::high_resolution_clock::now();
+  // ----------------------------------------------------------------
+  // Benchmark Phase (Timed)
+  // ----------------------------------------------------------------
+  std::cout << "[Benchmark] Running Scatter Phase...\n";
 
-    parlay::parallel_for(0, num_blocks, [&](size_t i) {
-        size_t start = i * block_size;
-        size_t end = std::min(start + block_size, n);
-        
-        // 准备当前 Block 的 input slice
-        auto tile_slice = parlay::make_slice(input.begin() + start, input.begin() + end);
-        auto pivots_slice = parlay::make_slice(pivots.begin(), pivots.end());
-        
-        // 准备当前 Block 的 output pointers
-        // 这是一个放在栈上的小数组 (num_buckets * 8 bytes)
-        // 假设 buckets <= 1024，栈空间足够 (8KB)
-        // 如果 buckets 很大，需要换成 std::vector 或 heap alloc
-        std::vector<T*> local_ptrs(num_buckets);
-        for(size_t b=0; b<num_buckets; ++b) {
-            local_ptrs[b] = block_write_ptrs[i * num_buckets + b];
-        }
+  // 每个 worker 一份 local_ptrs（计时外分配，ROI 内只 memcpy）
+  const size_t P = (size_t)parlay::num_workers();
+  std::vector<std::vector<T*>> tls_ptrs(P, std::vector<T*>(num_buckets));
 
-        // 调用核心函数
-        scatter_tile_merge_galloping_aligned(
-            tile_slice, 
-            pivots_slice, 
-            local_ptrs.data(), 
-            num_buckets
-        );
-    });
+  // cache flush/evict（计时外，且在 perf.enable 前）
+  flush_cache_readonly();
 
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end - start;
+  PerfFifoController perf; // 若没有设置 env，则 inactive
 
-    double gb = (double)n * sizeof(T) / 1e9;
-    double bw = gb / elapsed.count();
+  if (perf.active()) perf.enable();
+  auto t0 = std::chrono::high_resolution_clock::now();
 
-    std::cout << "RESULT: N=" << n << " Buckets=" << num_buckets 
-              << " Time=" << elapsed.count() << "s" 
-              << " Bandwidth=" << bw << " GB/s" << std::endl;
+  parlay::parallel_for(0, num_blocks, [&](size_t i) {
+    size_t s = i * block_size;
+    size_t e = std::min(s + block_size, n);
 
-    return 0;
+    auto tile_slice   = parlay::make_slice(input.begin() + s, input.begin() + e);
+    auto pivots_slice = parlay::make_slice(pivots.begin(), pivots.end());
+
+    auto& local_ptrs = tls_ptrs[(size_t)parlay::worker_id()];
+    std::memcpy(local_ptrs.data(),
+                &block_write_ptrs[i * num_buckets],
+                num_buckets * sizeof(T*));
+
+    scatter_tile_merge_galloping_aligned(
+      tile_slice,
+      pivots_slice,
+      local_ptrs.data(),
+      num_buckets
+    );
+  });
+
+  auto t1 = std::chrono::high_resolution_clock::now();
+  if (perf.active()) perf.disable();
+
+  std::chrono::duration<double> elapsed = t1 - t0;
+
+  // 你说的 goodput 口径：给两种（oneway / rw）
+  double gb_oneway = (double)n * sizeof(T) / 1e9;
+  double gb_rw     = 2.0 * gb_oneway;
+
+  std::cout << "ROI_SECONDS " << elapsed.count() << "\n";
+  std::cout << "EFFECTIVE_GBPS_ONEWAY " << (gb_oneway / elapsed.count()) << "\n";
+  std::cout << "EFFECTIVE_GBPS_RW "     << (gb_rw     / elapsed.count()) << "\n";
+
+  // 保留你原 RESULT 行（oneway）
+  std::cout << "RESULT: N=" << n << " Buckets=" << num_buckets
+            << " Time=" << elapsed.count() << "s"
+            << " Bandwidth=" << (gb_oneway / elapsed.count()) << " GB/s\n";
+
+  return 0;
 }

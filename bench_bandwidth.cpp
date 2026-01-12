@@ -8,12 +8,15 @@
 #include <numeric>
 #include <iomanip>
 #include <atomic>
-
+#include <sys/mman.h>
 // Parlay headers
 #include "parlay/parallel.h"
 #include "parlay/sequence.h"
 #include "parlay/utilities.h"
 #include <stdlib.h> // for posix_memalign, free
+
+#include "perf_ctl.hpp"
+#include "flush_range_clflushopt.h"
 
 // 一个简单的 RAII 包装器，用于管理 4KB 对齐的内存
 template<typename T>
@@ -22,10 +25,21 @@ struct AlignedArray {
     size_t n;
 
     AlignedArray(size_t size) : n(size) {
-        // 申请 4KB (4096) 对齐的内存
-        // 这样既满足 AVX-512 (64B)，也满足 Page 对齐
+        // 1. 内存分配
         if (posix_memalign((void**)&ptr, 4096, n * sizeof(T)) != 0) {
             throw std::runtime_error("Aligned allocation failed");
+        }
+
+        // ============================================================
+        // [新增] 2. 告诉内核：严禁在这块内存上使用大页 (THP)
+        // ============================================================
+        // 这会阻止内核在后台合并页面，防止物理地址变动和 Cache 污染
+        int ret = madvise(ptr, n * sizeof(T), MADV_NOHUGEPAGE);
+        if (ret != 0) {
+            perror("[Warning] madvise(MADV_NOHUGEPAGE) failed");
+            // 即使失败程序也能跑，但结果可能不对
+        } else {
+            // std::cout << "[System] THP disabled for this array." << std::endl;
         }
     }
 
@@ -66,18 +80,22 @@ void init_flush_buffer() {
     g_dummy_buffer = parlay::sequence<char>(FLUSH_SIZE_BYTES, 0);
 }
 
-void flush_cache() {
-    // 使用并行写入，强制所有核心参与 Cache 驱逐
-    // 写入操作比读取更能有效地触发 Cache 替换策略 (RFO)
-    parlay::parallel_for(0, g_dummy_buffer.size() / 64, [&](size_t i) {
-        // 写入每个 Cache Line 的第一个字节
-        // volatile 阻止编译器优化掉“无用”的写入
-        volatile char* ptr = &g_dummy_buffer[i * 64];
-        *ptr = (char)i;
-    });
-    // 内存屏障，防止乱序执行
-    std::atomic_thread_fence(std::memory_order_seq_cst);
+
+void flush_cache_readonly() {
+  const size_t nlines = g_dummy_buffer.size() / 64;
+  const size_t P = (size_t)parlay::num_workers();
+  std::vector<uint64_t> tls(P, 0);
+
+  parlay::parallel_for(0, nlines, [&](size_t i) {
+    size_t wid = (size_t)parlay::worker_id();
+    tls[wid] += (unsigned char)g_dummy_buffer[i * 64];
+  });
+
+  uint64_t sink = 0;
+  for (auto v : tls) sink ^= v;
+  asm volatile("" :: "r"(sink) : "memory");
 }
+
 
 // ==========================================
 // Kernels
@@ -270,53 +288,74 @@ void kernel_avx512_stream_prefetch(const unsigned int* src, unsigned int* dest, 
         _mm512_mask_storeu_epi32((void*)dest, mask, val);
     }
 }
-// ==========================================
-// 性能测试驱动
-// ==========================================
+
+
+// 你已有：kernel(src, dst, size)
 template<typename Range, typename Func>
-void benchmark_routine(std::string name, size_t n, size_t num_blocks, size_t block_size, 
-                       Range& source, Range& dest, // <--- 这里改用模板引用
-                       Func kernel){
-    
-    std::vector<double> bandwidths;
-    int iterations = 5; // 运行 5 次取平均/最大
-// auto src_ptr = source.begin();
-//     auto dst_ptr = dest.begin();
-    // 预热一次 (不计入统计，处理第一次 Page Table Walk)
-    flush_cache();
-    parlay::parallel_for(0, num_blocks, [&](size_t i) {
-        size_t start = i * block_size;
-        size_t end = std::min(start + block_size, n);
-        kernel(source.begin() + start, dest.begin() + start, end - start);
-    });
+void benchmark_routine_amp(
+    const std::string& name,
+    size_t n,
+    size_t num_blocks,
+    size_t block_size,
+    Range& source,
+    Range& dest,
+    Func kernel)
+{
+  PerfFifoController perf;
 
-    for(int iter = 0; iter < iterations; iter++) {
-        // 关键：每次运行前 Flush 2GB 数据
-        flush_cache();
+  // Warmup（不计入 ROI）
+//   flush_cache_readonly();
+//   parlay::parallel_for(0, num_blocks, [&](size_t i) {
+//     size_t s = i * block_size;
+//     size_t e = std::min(s + block_size, n);
+//     kernel(source.begin() + s, dest.begin() + s, e - s);
+//   });
 
-        auto start = std::chrono::high_resolution_clock::now();
+  // ROI：只做一次，交给 Python repeats
+//   flush_cache_readonly();
+flush_range_clflushopt((void*)source.begin(), n * sizeof(T));
+flush_range_clflushopt((void*)dest.begin(),   n * sizeof(T));
+std::this_thread::sleep_for(std::chrono::milliseconds(500));
+// 2. [新增] 强制锁定 source 为只读
+// 注意：source.begin() 必须是 4KB 对齐的 (你的 AlignedArray 已经是了)
+int ret = mprotect((void*)source.begin(), n * sizeof(T), PROT_READ);
+if (ret != 0) {
+    perror("mprotect failed");
+    exit(1);
+}
+std::cout << "[System] Source array marked as PROT_READ (Read-Only)." << std::endl;
 
-        // 核心并行循环
-        parlay::parallel_for(0, num_blocks, [&](size_t i) {
-            size_t start = i * block_size;
-            size_t end = std::min(start + block_size, n);
-            kernel(source.begin() + start, dest.begin() + start, end - start);
-        });
+  if (perf.active()) perf.enable();
+  auto t0 = std::chrono::high_resolution_clock::now();
 
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> elapsed = end - start;
+  parlay::parallel_for(0, num_blocks, [&](size_t i) {
+    size_t s = i * block_size;
+    size_t e = std::min(s + block_size, n);
+    kernel(source.begin() + s, dest.begin() + s, e - s);
+  });
+std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-        double gb = (double)n * sizeof(T) / (1024.0 * 1024.0 * 1024.0);
-        double bw = gb / elapsed.count(); // GB/s
-        bandwidths.push_back(bw);
-    }
+  auto t1 = std::chrono::high_resolution_clock::now();
+  if (perf.active()) perf.disable();
 
-    double max_bw = *std::max_element(bandwidths.begin(), bandwidths.end());
-    double avg_bw = std::accumulate(bandwidths.begin(), bandwidths.end(), 0.0) / bandwidths.size();
+  double roi_s = std::chrono::duration<double>(t1 - t0).count();
 
-    std::cout << std::left << std::setw(25) << name 
-              << "| Max: " << std::fixed << std::setprecision(2) << max_bw << " GB/s "
-              << "| Avg: " << avg_bw << " GB/s" << std::endl;
+  // goodput（按你的统一口径）
+  const double elem_bytes = (double)sizeof(typename std::remove_reference<decltype(*source.begin())>::type);
+  const double bytes_oneway = (double)n * elem_bytes;
+  const double bytes_rw = 2.0 * bytes_oneway;
+
+  const double good_oneway_gbps = bytes_oneway / roi_s / 1e9;
+  const double good_rw_gbps     = bytes_rw     / roi_s / 1e9;
+
+  // 固定输出：Python 解析就靠这些行
+  std::cout << "KERNEL " << name << "\n";
+  std::cout << "TYPE_BYTES " << (size_t)elem_bytes << "\n";
+  std::cout << "N " << n << "\n";
+  std::cout << "BLOCK_SIZE " << block_size << "\n";
+  std::cout << "ROI_SECONDS " << std::setprecision(9) << roi_s << "\n";
+  std::cout << "GOODPUT_ONEWAY_GBps " << std::setprecision(6) << good_oneway_gbps << "\n";
+  std::cout << "GOODPUT_RW_GBps "     << std::setprecision(6) << good_rw_gbps << "\n";
 }
 // ==========================================
 // 6. AVX512 Stream Store - Blocked / Tiled Version
@@ -527,7 +566,7 @@ int main(int argc, char* argv[]) {
     std::cout << "=================================================" << std::endl;
 
     // 1. 初始化 Flush Buffer
-    init_flush_buffer();
+    // init_flush_buffer();
 
     // ==========================================
     // 1. 使用我们自定义的对齐数组 (RAII)
@@ -568,24 +607,23 @@ int main(int argc, char* argv[]) {
 
     std::cout << "\n[Running Benchmarks]..." << std::endl;
 
-    // 辅助 lambda：检查名字并运行
-    auto run = [&](std::string name, auto kernel) {
-        // 如果 target 是 "all" 或者 包含了当前名字 (简单模糊匹配)
-        if (target_kernel == "all" || target_kernel == name) {
-            benchmark_routine(name, n, num_blocks, block_size, source, dest, kernel);
-        }
-    };
+    auto run1 = [&](std::string name, auto kernel) {
+  if (target_kernel == "all" || target_kernel == name) {
+    benchmark_routine_amp(name, n, num_blocks, block_size, source, dest, kernel);
+  }
+};
 
-    // 注册所有测试
-    run("std_copy", kernel_std_copy);
-    run("std_move", kernel_std_move);
-    run("avx2", kernel_avx256_copy);
-    run("avx512", kernel_avx512_copy);
-    run("stream", kernel_avx512_stream);
-    run("stream_prefetch", kernel_avx512_stream_prefetch);
-    run("stream_blocked", kernel_avx512_stream_blocked);
-    run("mimic_scatter", kernel_mimic_scatter);
-    run("avx2_stream", kernel_avx2_stream);
+// 建议：Python 里每次只传一个 kernel，这里仍支持 all
+run1("std_copy", kernel_std_copy);
+run1("std_move", kernel_std_move);
+run1("avx2", kernel_avx256_copy);
+run1("avx512", kernel_avx512_copy);
+run1("stream", kernel_avx512_stream);
+run1("stream_prefetch", kernel_avx512_stream_prefetch);
+run1("stream_blocked", kernel_avx512_stream_blocked);
+run1("mimic_scatter", kernel_mimic_scatter);
+run1("avx2_stream", kernel_avx2_stream);
+
 
     return 0;
 }
