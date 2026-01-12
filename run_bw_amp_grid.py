@@ -96,6 +96,7 @@ def perf_noise(event_str: str, sleep_s: float, out_csv: Path):
         raise RuntimeError(p.stderr)
     txt = out_csv.read_text()
     rb, wb = parse_perf_stat_csv(txt)
+    # Return GB/s rates
     return (rb/sleep_s/1e9, wb/sleep_s/1e9, (rb+wb)/sleep_s/1e9)
 
 def main():
@@ -108,6 +109,7 @@ def main():
     ap.add_argument("--kernels", default="std_copy,std_move,avx2,avx512,stream,stream_prefetch,stream_blocked,mimic_scatter,avx2_stream")
     ap.add_argument("--csv-name", default="grid_results.csv")
     args, rest = ap.parse_known_args()
+    
     if rest and rest[0] == "--":
         rest = rest[1:]
     if not rest:
@@ -137,12 +139,20 @@ def main():
     out_csv = root / args.csv_name
     with out_csv.open("w", newline="") as fcsv:
         w = csv.writer(fcsv)
+        # -------------------------------------------------------------------
+        # [MODIFIED] Header: Added Volume (GB) and split AMP columns
+        # -------------------------------------------------------------------
         w.writerow([
             "n", "block", "kernel", "rep",
             "roi_s", "type_bytes",
-            "goodput_oneway_gbps", "goodput_rw_gbps",
-            "imc_read_gbps", "imc_write_gbps", "imc_total_gbps",
-            "amp",
+            "logical_gb",          # 理论单向数据量 (Array Size)
+            "imc_read_gb",         # 实际 IMC 读取数据量
+            "imc_write_gb",        # 实际 IMC 写入数据量
+            "amp_read",            # 读放大
+            "amp_write",           # 写放大
+            "amp_total",           # 总放大
+            "goodput_rw_gbps",     # 依然保留带宽数据供参考
+            "imc_total_gbps",      
             "noise_total_gbps",
             "run_dir"
         ])
@@ -207,27 +217,51 @@ def main():
                 # parse required keys
                 roi_s = float(parse_kv(p.stdout, "ROI_SECONDS"))
                 type_bytes = int(parse_kv(p.stdout, "TYPE_BYTES"))
-                good_one = float(parse_kv(p.stdout, "GOODPUT_ONEWAY_GBps"))
-                good_rw = float(parse_kv(p.stdout, "GOODPUT_RW_GBps"))
+                good_rw_gbps = float(parse_kv(p.stdout, "GOODPUT_RW_GBps"))
 
+                # -------------------------------------------------------------------
+                # [MODIFIED] Logic Calculation
+                # -------------------------------------------------------------------
                 rb, wb = parse_perf_stat_csv(perf_csv.read_text())
-                imc_r = rb / roi_s / 1e9
-                imc_w = wb / roi_s / 1e9
-                imc_t = (rb + wb) / roi_s / 1e9
+                
+                # Logical size (Bytes) for one array (Assumption: Copy A -> B)
+                # Read Ideal = size of A
+                # Write Ideal = size of B
+                logical_bytes = n * type_bytes
+                
+                # Convert to GB (10^9) for display
+                logical_gb = logical_bytes / 1e9
+                imc_read_gb = rb / 1e9
+                imc_write_gb = wb / 1e9
 
-                ideal_bytes = 2.0 * n * type_bytes
-                amp = (rb + wb) / ideal_bytes if ideal_bytes > 0 else float("nan")
+                # Amplification Calculations
+                # Avoid division by zero
+                if logical_bytes > 0:
+                    amp_r = rb / logical_bytes
+                    amp_w = wb / logical_bytes
+                    amp_t = (rb + wb) / (logical_bytes * 2.0) # Total traffic vs 2x data
+                else:
+                    amp_r = amp_w = amp_t = float("nan")
+
+                # Bandwidth (for reference)
+                imc_total_gbps = (rb + wb) / roi_s / 1e9
 
                 w.writerow([n, blk, ker, rep,
                             f"{roi_s:.9f}", type_bytes,
-                            f"{good_one:.6f}", f"{good_rw:.6f}",
-                            f"{imc_r:.6f}", f"{imc_w:.6f}", f"{imc_t:.6f}",
-                            f"{amp:.6f}",
+                            f"{logical_gb:.6f}",    # Logical Size (e.g., 4.00 GB)
+                            f"{imc_read_gb:.6f}",   # Actual Read (e.g., 5.30 GB)
+                            f"{imc_write_gb:.6f}",  # Actual Write (e.g., 4.00 GB)
+                            f"{amp_r:.3f}",         # Read Amp
+                            f"{amp_w:.3f}",         # Write Amp
+                            f"{amp_t:.3f}",         # Total Amp
+                            f"{good_rw_gbps:.3f}",
+                            f"{imc_total_gbps:.3f}",
                             f"{noise_t:.6f}",
                             str(run_dir)])
 
-                print(f"[{idx}/{total}] OK {tag} ROI={roi_s:.4f}s IMC={imc_t:.1f}GB/s "
-                      f"goodRW={good_rw:.1f}GB/s amp={amp:.2f} noise={noise_t:.3f}GB/s")
+                print(f"[{idx}/{total}] OK {tag} "
+                      f"Log:{logical_gb:.2f}G IMC_R:{imc_read_gb:.2f}G({amp_r:.2f}x) "
+                      f"IMC_W:{imc_write_gb:.2f}G({amp_w:.2f}x)")
 
     print(f"\nDONE. Results: {out_csv}")
     print(f"Root dir: {root}")

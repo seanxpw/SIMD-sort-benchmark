@@ -149,7 +149,72 @@ void scatter_tile_merge_galloping_aligned(parlay::slice<InIterator, InIterator> 
          bucket_ptrs[num_buckets - 1] = (OutIterator)dest_ptr;
     }
 }
+template <typename InIterator, typename PivotIterator, typename OutIterator>
+void scatter_tile_merge_std_move(parlay::slice<InIterator, InIterator> tile,
+                                 parlay::slice<PivotIterator, PivotIterator> pivots,
+                                 OutIterator* bucket_ptrs,
+                                 size_t num_buckets) {
+    if (tile.size() == 0) return;
 
+    auto curr_it = tile.begin();
+    auto end_it = tile.end();
+    auto pit = pivots.begin();
+    auto pend = pivots.end();
+
+    // 当前写入的 bucket 指针
+    // 假设 OutIterator 是 T*，我们统一转成 T* 操作
+    using T = typename std::iterator_traits<InIterator>::value_type;
+    T* dest_ptr = (T*)bucket_ptrs[0];
+
+    // 遍历每一个 Pivot (即每一个 Bucket)
+    for (size_t b = 0; b < num_buckets; ++b) {
+        // 获取当前 Pivot 值，如果是最后一个 bucket，pivot 设为最大值
+        T p_val = (pit != pend) ? *pit : std::numeric_limits<T>::max();
+
+        // 核心逻辑：Galloping / 线性扫描
+        // 只要当前元素 < pivot，就属于当前 bucket
+        while (curr_it != end_it) {
+            T val = *curr_it;
+            if (val < p_val) {
+                // 1. 写入数据 (std::move)
+                // 编译器通常会生成普通 Store (mov / vmovdqu)，会污染 Cache
+                *dest_ptr = std::move(val); 
+                
+                // 2. 指针推进
+                ++dest_ptr;
+                ++curr_it;
+            } else {
+                // 当前元素 >= pivot，说明当前 bucket 已填完
+                // 跳出内层循环，进入下一个 bucket
+                break;
+            }
+        }
+
+        // 更新当前 bucket 的尾指针
+        bucket_ptrs[b] = (OutIterator)dest_ptr;
+
+        // 准备处理下一个 bucket
+        if (pit != pend) ++pit;
+        if (b + 1 < num_buckets) {
+            // 切换到下一个 bucket 的写入位置
+            dest_ptr = (T*)bucket_ptrs[b + 1];
+        }
+    }
+
+    // 处理剩余元素 (Last Bucket logic)
+    // 实际上上面的循环中，如果 b == num_buckets - 1，p_val 是 max，
+    // 应该已经把剩余所有元素都收进去了。
+    // 但为了逻辑严谨性（防止 pivot 没覆盖完），可以保留这个尾部检查
+    while (curr_it != end_it) {
+        *dest_ptr = std::move(*curr_it);
+        ++dest_ptr;
+        ++curr_it;
+    }
+    // 更新最后一个 bucket 的指针（如果是通过循环退出的，可能已经更过了，这里确保一下）
+    if (num_buckets > 0) {
+        bucket_ptrs[num_buckets - 1] = (OutIterator)dest_ptr;
+    }
+}
 // ============================================================
 // Benchmarking Infrastructure
 // ============================================================
@@ -273,6 +338,7 @@ int main(int argc, char* argv[]) {
   size_t block_size = 256 * 1024;  // 256K elements (对 int32 是 1MB)
   DistType dist = DIST_UNIFORM;
   std::string dist_name = "uniform";
+  printf("threads number: %d\n", parlay::num_workers());
 
   if (argc > 1) n = std::stoull(argv[1]);
   if (argc > 2) num_buckets = std::stoull(argv[2]);
@@ -388,7 +454,13 @@ int main(int argc, char* argv[]) {
                 &block_write_ptrs[i * num_buckets],
                 num_buckets * sizeof(T*));
 
-    scatter_tile_merge_galloping_aligned(
+    // scatter_tile_merge_galloping_aligned(
+    //   tile_slice,
+    //   pivots_slice,
+    //   local_ptrs.data(),
+    //   num_buckets
+    // );
+    scatter_tile_merge_std_move(
       tile_slice,
       pivots_slice,
       local_ptrs.data(),
@@ -396,23 +468,27 @@ int main(int argc, char* argv[]) {
     );
   });
 
-  auto t1 = std::chrono::high_resolution_clock::now();
+auto t1 = std::chrono::high_resolution_clock::now();
   if (perf.active()) perf.disable();
 
   std::chrono::duration<double> elapsed = t1 - t0;
 
-  // 你说的 goodput 口径：给两种（oneway / rw）
+  // 1. 基础数据
   double gb_oneway = (double)n * sizeof(T) / 1e9;
-  double gb_rw     = 2.0 * gb_oneway;
+  double gb_rw     = 2.0 * gb_oneway; // Scatter 也是读 Input 写 Output
 
+  // 2. 打印 Key-Value 供 Python 解析
+  // 注意：确保 T 在此前已定义，通常 scatter 是 int 或 uint32_t
+  std::cout << "TYPE_BYTES " << sizeof(T) << "\n"; 
   std::cout << "ROI_SECONDS " << elapsed.count() << "\n";
-  std::cout << "EFFECTIVE_GBPS_ONEWAY " << (gb_oneway / elapsed.count()) << "\n";
-  std::cout << "EFFECTIVE_GBPS_RW "     << (gb_rw     / elapsed.count()) << "\n";
+  
+  // 统一命名为 GOODPUT，方便脚本解析
+  std::cout << "GOODPUT_ONEWAY_GBps " << (gb_oneway / elapsed.count()) << "\n";
+  std::cout << "GOODPUT_RW_GBps "     << (gb_rw     / elapsed.count()) << "\n";
 
-  // 保留你原 RESULT 行（oneway）
-  std::cout << "RESULT: N=" << n << " Buckets=" << num_buckets
-            << " Time=" << elapsed.count() << "s"
-            << " Bandwidth=" << (gb_oneway / elapsed.count()) << " GB/s\n";
+  // 3. 人类可读的结尾（脚本会忽略这行，因为没有 Key Match）
+  std::cout << "RESULT: N=" << n << " Buckets=" << num_buckets 
+            << " Time=" << elapsed.count() << "s\n";
 
   return 0;
 }
