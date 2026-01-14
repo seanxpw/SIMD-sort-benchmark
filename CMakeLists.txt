@@ -19,7 +19,7 @@ add_compile_options(-O3 -march=native -pthread -Wall)
 # ==========================================
 # 包含 ParlayLib 头文件
 include_directories(${CMAKE_SOURCE_DIR}/extern/parlaylib/include)
-
+include_directories(${CMAKE_SOURCE_DIR}/extern/x86-smid-sort/src)
 # ==========================================
 # 3. 自动发现并编译所有 CPP 文件
 # ==========================================
