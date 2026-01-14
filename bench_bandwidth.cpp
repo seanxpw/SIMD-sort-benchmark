@@ -18,28 +18,29 @@
 #include "perf_ctl.hpp"
 #include "flush_range_clflushopt.h"
 
-// 一个简单的 RAII 包装器，用于管理 4KB 对齐的内存
 template<typename T>
 struct AlignedArray {
     T* ptr;
     size_t n;
 
     AlignedArray(size_t size) : n(size) {
-        // 1. 内存分配
-        if (posix_memalign((void**)&ptr, 4096, n * sizeof(T)) != 0) {
+        // 1. 内存分配：使用 2MB 对齐 (Huge Page 友好)
+        // 2MB = 2 * 1024 * 1024 = 2097152
+        size_t alignment = 2 * 1024 * 1024; 
+        
+        // 注意：分配大小最好也是 2MB 的倍数，或者足够大
+        if (posix_memalign((void**)&ptr, alignment, n * sizeof(T)) != 0) {
             throw std::runtime_error("Aligned allocation failed");
         }
 
         // ============================================================
-        // [新增] 2. 告诉内核：严禁在这块内存上使用大页 (THP)
+        // [修改] 2. 告诉内核：请务必使用大页 (THP)
         // ============================================================
-        // 这会阻止内核在后台合并页面，防止物理地址变动和 Cache 污染
-        int ret = madvise(ptr, n * sizeof(T), MADV_NOHUGEPAGE);
+        int ret = madvise(ptr, n * sizeof(T), MADV_HUGEPAGE);
         if (ret != 0) {
-            perror("[Warning] madvise(MADV_NOHUGEPAGE) failed");
-            // 即使失败程序也能跑，但结果可能不对
+            perror("[Warning] madvise(MADV_HUGEPAGE) failed");
         } else {
-            // std::cout << "[System] THP disabled for this array." << std::endl;
+             // std::cout << "[System] THP explicitly enabled." << std::endl;
         }
     }
 
@@ -47,13 +48,10 @@ struct AlignedArray {
         free(ptr);
     }
 
-    // 核心：包装成 parlay::slice
-    // 这就是你要的 "Wrap into sequence" (实际上是 slice，表现得像 sequence)
     auto as_slice() {
         return parlay::make_slice(ptr, ptr + n);
     }
     
-    // 方便访问原生指针
     T* begin() { return ptr; }
     T* end() { return ptr + n; }
     T& operator[](size_t i) { return ptr[i]; }
@@ -315,15 +313,15 @@ void benchmark_routine_amp(
 //   flush_cache_readonly();
 flush_range_clflushopt((void*)source.begin(), n * sizeof(T));
 flush_range_clflushopt((void*)dest.begin(),   n * sizeof(T));
-std::this_thread::sleep_for(std::chrono::milliseconds(500));
+std::this_thread::sleep_for(std::chrono::milliseconds(200));
 // 2. [新增] 强制锁定 source 为只读
 // 注意：source.begin() 必须是 4KB 对齐的 (你的 AlignedArray 已经是了)
-int ret = mprotect((void*)source.begin(), n * sizeof(T), PROT_READ);
-if (ret != 0) {
-    perror("mprotect failed");
-    exit(1);
-}
-std::cout << "[System] Source array marked as PROT_READ (Read-Only)." << std::endl;
+// int ret = mprotect((void*)source.begin(), n * sizeof(T), PROT_READ);
+// if (ret != 0) {
+//     perror("mprotect failed");
+//     exit(1);
+// }
+// std::cout << "[System] Source array marked as PROT_READ (Read-Only)." << std::endl;
 
   if (perf.active()) perf.enable();
   auto t0 = std::chrono::high_resolution_clock::now();
@@ -333,7 +331,7 @@ std::cout << "[System] Source array marked as PROT_READ (Read-Only)." << std::en
     size_t e = std::min(s + block_size, n);
     kernel(source.begin() + s, dest.begin() + s, e - s);
   });
-std::this_thread::sleep_for(std::chrono::milliseconds(100));
+// std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   auto t1 = std::chrono::high_resolution_clock::now();
   if (perf.active()) perf.disable();
@@ -575,15 +573,16 @@ int main(int argc, char* argv[]) {
     AlignedArray<unsigned int> source_raw(n);
     AlignedArray<unsigned int> dest_raw(n);
 
+// ==========================================
+    // 2. 初始化数据 (使用 Parlay 代替 OpenMP)
     // ==========================================
-    // 2. 初始化数据 (OpenMP Parallel)
-    // ==========================================
-    // 直接操作裸指针，速度最快且 First-Touch 友好
-    #pragma omp parallel for schedule(static)
-    for (size_t i = 0; i < n; ++i) {
+    std::cout << "[Init] Touching memory with Parlay workers..." << std::endl;
+    
+    // 使用与测试相同的线程池，确保 NUMA 亲和性和 Cache 预热
+    parlay::parallel_for(0, n, [&](size_t i) {
         source_raw[i] = (unsigned int)i;
-        dest_raw[i] = 0;
-    }
+        dest_raw[i] = 0; // 这一步写入会触发 2MB 大页的分配
+    });
 
     // ==========================================
     // 3. 包装成 Slice (The "Wrap")

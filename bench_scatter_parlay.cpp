@@ -338,8 +338,12 @@ int main(int argc, char* argv[]) {
   size_t block_size = 256 * 1024;  // 256K elements (对 int32 是 1MB)
   DistType dist = DIST_UNIFORM;
   std::string dist_name = "uniform";
+
+  std::string target_mode = "all"; // 新增：选择 scatter 模式（默认跑所有）
+
   printf("threads number: %d\n", parlay::num_workers());
 
+  // 位置参数解析：n, num_buckets, block_size, dist, mode
   if (argc > 1) n = std::stoull(argv[1]);
   if (argc > 2) num_buckets = std::stoull(argv[2]);
   if (argc > 3) block_size = std::stoull(argv[3]);
@@ -347,10 +351,22 @@ int main(int argc, char* argv[]) {
     dist_name = argv[4];
     if (dist_name == "sorted") dist = DIST_SORTED;
     else if (dist_name == "reverse") dist = DIST_REVERSE;
+    else dist = DIST_UNIFORM, dist_name = "uniform";
+  }
+  if (argc > 5) {
+    target_mode = argv[5]; // all / std_move / avx512_stream / ...
   }
 
-  std::cout << "Config: N=" << n << ", Buckets=" << num_buckets
-            << ", BlockSize=" << block_size << ", Dist=" << dist_name << "\n";
+  std::cout << "=================================================\n";
+  std::cout << "Scatter Microbenchmark (Registered Modes)\n";
+  std::cout << "N          : " << n << "\n";
+  std::cout << "Buckets    : " << num_buckets << "\n";
+  std::cout << "BlockSize  : " << block_size << " elements\n";
+  std::cout << "Dist       : " << dist_name << "\n";
+  std::cout << "Mode       : " << target_mode << "\n";
+  std::cout << "Workers    : " << parlay::num_workers() << "\n";
+  std::cout << "Flush Size : " << FLUSH_SIZE_BYTES / 1024 / 1024 << " MB\n";
+  std::cout << "=================================================\n";
 
   // ----------------------------------------------------------------
   // Setup Phase (Not Timed)
@@ -358,7 +374,7 @@ int main(int argc, char* argv[]) {
   std::cout << "[Setup] Generating data...\n";
   auto input = generate_data(n, dist);
 
-  init_flush_buffer();
+//   init_flush_buffer();
 
   // 预分配输出数组
   parlay::sequence<T> output(n + 4096, 0);
@@ -372,8 +388,6 @@ int main(int argc, char* argv[]) {
   // 生成 pivots
   parlay::sequence<T> pivots(num_buckets - 1);
   if (dist == DIST_UNIFORM) {
-    // 让 pivots 覆盖 int32 全域且单调：在 ordered uint32 空间均匀切分，再映射回 int32
-    // step = 2^32 / num_buckets
     uint64_t step = (uint64_t(1) << 32) / (uint64_t)num_buckets;
     for (size_t i = 0; i < num_buckets - 1; ++i) {
       uint32_t u = (uint32_t)((uint64_t)(i + 1) * step);
@@ -381,7 +395,6 @@ int main(int argc, char* argv[]) {
       pivots[i] = (T)p;
     }
   } else {
-    // sorted/reverse：你原逻辑（按值域/范围切分）
     long long min_val = std::numeric_limits<int>::min();
     long long range = (long long)n;
     double step = (double)range / (double)num_buckets;
@@ -401,7 +414,6 @@ int main(int argc, char* argv[]) {
 
   // Phase 1.5: Oracle Counts
   std::cout << "[Setup] Calculating offsets (Oracle)...\n";
-
   parlay::sequence<size_t> block_bucket_counts(num_blocks * num_buckets);
 
   parlay::parallel_for(0, num_blocks, [&](size_t i) {
@@ -426,69 +438,87 @@ int main(int argc, char* argv[]) {
   }
 
   // ----------------------------------------------------------------
-  // Benchmark Phase (Timed)
+  // Benchmark Phase (Timed) - Registered Modes
   // ----------------------------------------------------------------
   std::cout << "[Benchmark] Running Scatter Phase...\n";
 
   // 每个 worker 一份 local_ptrs（计时外分配，ROI 内只 memcpy）
   const size_t P = (size_t)parlay::num_workers();
   std::vector<std::vector<T*>> tls_ptrs(P, std::vector<T*>(num_buckets));
-
-  // cache flush/evict（计时外，且在 perf.enable 前）
-  flush_cache_readonly();
+  flush_range_clflushopt((void*)input.begin(), n * sizeof(T));
+  flush_range_clflushopt((void*)output.begin(),   n * sizeof(T));
 
   PerfFifoController perf; // 若没有设置 env，则 inactive
 
-  if (perf.active()) perf.enable();
-  auto t0 = std::chrono::high_resolution_clock::now();
+  auto bench_one = [&](const std::string& mode_name, auto&& kernel) {
+    if (!(target_mode == "all" || target_mode == mode_name)) return;
 
-  parlay::parallel_for(0, num_blocks, [&](size_t i) {
-    size_t s = i * block_size;
-    size_t e = std::min(s + block_size, n);
+    // cache flush/evict（计时外，且在 perf.enable 前）
+    // flush_cache_readonly();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    auto tile_slice   = parlay::make_slice(input.begin() + s, input.begin() + e);
-    auto pivots_slice = parlay::make_slice(pivots.begin(), pivots.end());
+    if (perf.active()) perf.enable();
+    auto t0 = std::chrono::high_resolution_clock::now();
 
-    auto& local_ptrs = tls_ptrs[(size_t)parlay::worker_id()];
-    std::memcpy(local_ptrs.data(),
-                &block_write_ptrs[i * num_buckets],
-                num_buckets * sizeof(T*));
+    parlay::parallel_for(0, num_blocks, [&](size_t i) {
+      size_t s = i * block_size;
+      size_t e = std::min(s + block_size, n);
 
-    // scatter_tile_merge_galloping_aligned(
-    //   tile_slice,
-    //   pivots_slice,
-    //   local_ptrs.data(),
-    //   num_buckets
-    // );
-    scatter_tile_merge_std_move(
-      tile_slice,
-      pivots_slice,
-      local_ptrs.data(),
-      num_buckets
-    );
-  });
+      auto tile_slice   = parlay::make_slice(input.begin() + s, input.begin() + e);
+      auto pivots_slice = parlay::make_slice(pivots.begin(), pivots.end());
 
-auto t1 = std::chrono::high_resolution_clock::now();
-  if (perf.active()) perf.disable();
+      auto& local_ptrs = tls_ptrs[(size_t)parlay::worker_id()];
+      std::memcpy(local_ptrs.data(),
+                  &block_write_ptrs[i * num_buckets],
+                  num_buckets * sizeof(T*));
 
-  std::chrono::duration<double> elapsed = t1 - t0;
+      kernel(tile_slice, pivots_slice, local_ptrs.data(), num_buckets);
+    });
 
-  // 1. 基础数据
-  double gb_oneway = (double)n * sizeof(T) / 1e9;
-  double gb_rw     = 2.0 * gb_oneway; // Scatter 也是读 Input 写 Output
+    auto t1 = std::chrono::high_resolution_clock::now();
+    if (perf.active()) perf.disable();
 
-  // 2. 打印 Key-Value 供 Python 解析
-  // 注意：确保 T 在此前已定义，通常 scatter 是 int 或 uint32_t
-  std::cout << "TYPE_BYTES " << sizeof(T) << "\n"; 
-  std::cout << "ROI_SECONDS " << elapsed.count() << "\n";
-  
-  // 统一命名为 GOODPUT，方便脚本解析
-  std::cout << "GOODPUT_ONEWAY_GBps " << (gb_oneway / elapsed.count()) << "\n";
-  std::cout << "GOODPUT_RW_GBps "     << (gb_rw     / elapsed.count()) << "\n";
+    std::chrono::duration<double> elapsed = t1 - t0;
 
-  // 3. 人类可读的结尾（脚本会忽略这行，因为没有 Key Match）
-  std::cout << "RESULT: N=" << n << " Buckets=" << num_buckets 
-            << " Time=" << elapsed.count() << "s\n";
+    double gb_oneway = (double)n * sizeof(T) / 1e9;
+    double gb_rw     = 2.0 * gb_oneway;
+
+    // 输出：加入 MODE 字段，方便 Python 聚合
+    std::cout << "MODE " << mode_name << "\n";
+    std::cout << "TYPE_BYTES " << sizeof(T) << "\n";
+    std::cout << "ROI_SECONDS " << elapsed.count() << "\n";
+    std::cout << "GOODPUT_ONEWAY_GBps " << (gb_oneway / elapsed.count()) << "\n";
+    std::cout << "GOODPUT_RW_GBps "     << (gb_rw     / elapsed.count()) << "\n";
+    std::cout << "RESULT: MODE=" << mode_name
+              << " N=" << n << " Buckets=" << num_buckets
+              << " Time=" << elapsed.count() << "s\n";
+  };
+
+  // --- 注册 kernels（你要加模式就往下加 run）---
+  auto kernel_std_move_wrap = [&](auto tile, auto piv, T** ptrs, size_t nb) {
+    scatter_tile_merge_std_move(tile, piv, ptrs, nb);
+  };
+
+  auto kernel_avx512_stream_wrap = [&](auto tile, auto piv, T** ptrs, size_t nb) {
+    scatter_tile_merge_galloping_aligned(tile, piv, ptrs, nb);
+  };
+
+  // 你希望的“注册式 run1”
+  auto run1 = [&](const std::string& name, auto&& k) {
+    bench_one(name, std::forward<decltype(k)>(k));
+  };
+
+  run1("std_move",      kernel_std_move_wrap);
+  run1("avx512_galloping_aligned", kernel_avx512_stream_wrap);
+
+  // 如果用户传了未知模式，给出提示并返回错误码
+  if (target_mode != "all" &&
+      target_mode != "std_move" &&
+      target_mode != "avx512_galloping_aligned") {
+    std::cerr << "[Error] Unknown mode: " << target_mode << "\n";
+    std::cerr << "Available modes: all | std_move | avx512_galloping_aligned\n";
+    return 2;
+  }
 
   return 0;
 }
