@@ -4,3 +4,6 @@
 [submodule "extern/x86-smid-sort"]
 	path = extern/x86-smid-sort
 	url = https://github.com/numpy/x86-simd-sort.git
+[submodule "extern/parlaylib_numa"]
+	path = extern/parlaylib_numa
+	url = https://github.com/seanxpw/parlaylib_numa.git
