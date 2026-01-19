@@ -1,43 +1,93 @@
 cmake_minimum_required(VERSION 3.10)
-
 project(SimdSortBenchmark LANGUAGES CXX)
 
-# ==========================================
-# 1. 基础配置
-# ==========================================
+# --------------------------
+# 1) Basic config
+# --------------------------
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# 编译选项
-# -O3: 最高优化
-# -march=native: 针对本机 CPU (Cascade Lake) 开启 AVX512
-# -pthread: 开启多线程支持
-add_compile_options(-O3 -march=native -pthread -Wall)
+# Common compile flags
+add_compile_options(-O3 -march=native -pthread -Wall -Wextra)
 
-# ==========================================
-# 2. 包含路径
-# ==========================================
-# 包含 ParlayLib 头文件
-include_directories(${CMAKE_SOURCE_DIR}/extern/parlaylib/include)
-include_directories(${CMAKE_SOURCE_DIR}/extern/x86-smid-sort/src)
-# ==========================================
-# 3. 自动发现并编译所有 CPP 文件
-# ==========================================
+# Use folders in IDEs
+set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
-# 查找当前目录下所有的 .cpp 文件，存入 SOURCE_FILES 变量
-file(GLOB SOURCE_FILES "*.cpp")
+# --------------------------
+# 2) Include roots
+# --------------------------
+set(PARLAY_ORIG_INC  ${CMAKE_SOURCE_DIR}/extern/parlaylib/include)
+set(PARLAY_NUMA_INC  ${CMAKE_SOURCE_DIR}/extern/parlaylib_numa/include)
+set(SIMDSORT_INC     ${CMAKE_SOURCE_DIR}/extern/x86-smid-sort/src)
 
-# 遍历每一个找到的源文件
-foreach(SOURCE_FILE ${SOURCE_FILES})
-    # 获取文件名（不带扩展名），例如 "bench_bw.cpp" -> "bench_bw"
-    get_filename_component(EXE_NAME ${SOURCE_FILE} NAME_WE)
+# Your benchmark sources (current dir only)
+file(GLOB BENCH_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/*.cpp")
 
-    # 打印消息，让你知道哪些文件被编译了
-    message(STATUS "Adding executable: ${EXE_NAME} from source ${SOURCE_FILE}")
+if (NOT BENCH_SOURCES)
+  message(FATAL_ERROR "No .cpp files found in ${CMAKE_SOURCE_DIR}")
+endif()
 
-    # 创建可执行文件
-    add_executable(${EXE_NAME} ${SOURCE_FILE})
+# --------------------------
+# 3) Helper function to build two variants per source
+# --------------------------
+function(add_dual_parlay_executables SRC)
+  get_filename_component(BASE ${SRC} NAME_WE)
 
-    # 链接必要的库 (pthread)
-    target_link_libraries(${EXE_NAME} pthread)
+  # -------------------- orig variant --------------------
+  set(TGT_ORIG "${BASE}_orig")
+  add_executable(${TGT_ORIG} ${SRC})
+
+  target_include_directories(${TGT_ORIG} PRIVATE
+    ${PARLAY_ORIG_INC}
+    ${SIMDSORT_INC}
+    ${CMAKE_SOURCE_DIR}        # so you can include local helper headers
+  )
+
+  target_link_libraries(${TGT_ORIG} PRIVATE pthread)
+
+  target_compile_definitions(${TGT_ORIG} PRIVATE
+    PARLAY_BENCH_VARIANT_ORIG=1
+  )
+
+  set_target_properties(${TGT_ORIG} PROPERTIES
+    OUTPUT_NAME "${TGT_ORIG}"
+    FOLDER "orig"
+  )
+
+  # -------------------- numa variant --------------------
+  set(TGT_NUMA "${BASE}_numa")
+  add_executable(${TGT_NUMA} ${SRC})
+
+  target_include_directories(${TGT_NUMA} PRIVATE
+    ${PARLAY_NUMA_INC}
+    ${SIMDSORT_INC}
+    ${CMAKE_SOURCE_DIR}
+  )
+
+  # numa-aware variant typically needs libnuma on Linux
+  find_library(NUMA_LIB numa)
+  if (NUMA_LIB)
+    target_link_libraries(${TGT_NUMA} PRIVATE pthread ${NUMA_LIB})
+  else()
+    target_link_libraries(${TGT_NUMA} PRIVATE pthread)
+    message(WARNING "libnuma not found. ${TGT_NUMA} may fail to link if it uses NUMA APIs.")
+  endif()
+
+  target_compile_definitions(${TGT_NUMA} PRIVATE
+    PARLAY_BENCH_VARIANT_NUMA=1
+  )
+
+  set_target_properties(${TGT_NUMA} PROPERTIES
+    OUTPUT_NAME "${TGT_NUMA}"
+    FOLDER "numa"
+  )
+endfunction()
+
+# --------------------------
+# 4) Add all benchmarks
+# --------------------------
+foreach(SRC ${BENCH_SOURCES})
+  message(STATUS "Adding dual executables for: ${SRC}")
+  add_dual_parlay_executables(${SRC})
 endforeach()
