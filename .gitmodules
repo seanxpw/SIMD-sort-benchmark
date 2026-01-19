@@ -7,3 +7,6 @@
 [submodule "extern/parlaylib_numa"]
 	path = extern/parlaylib_numa
 	url = https://github.com/seanxpw/parlaylib_numa.git
+[submodule "extern/numactl"]
+	path = extern/numactl
+	url = https://github.com/numactl/numactl.git
