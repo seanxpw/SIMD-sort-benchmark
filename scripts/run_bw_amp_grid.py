@@ -102,15 +102,16 @@ def main():
 
     ap = argparse.ArgumentParser("Bandwidth-kernel amp grid using perf IMC + FIFO ROI gating")
     ap.add_argument("-o", "--outdir", default="./bw_runs")
-    ap.add_argument("--repeats", type=int, default=3)
-    ap.add_argument("--noise-s", type=float, default=0.2)
+    ap.add_argument("--repeats", type=int, default=5)
+    ap.add_argument("--noise-s", type=float, default=0.1)
     ap.add_argument("--n", default="1000000000")
     
     # === [关键修改] 使用生成的默认值 ===
     ap.add_argument("--block", default=default_blocks, 
                     help=f"Block sizes (powers of 2). Default: {default_blocks}")
     
-    ap.add_argument("--kernels", default="std_copy,std_move,avx2,avx512,stream,stream_prefetch,stream_blocked,mimic_scatter,avx2_stream")
+    # ap.add_argument("--kernels", default="std_copy,std_move,avx2,avx512,stream,stream_prefetch,stream_blocked,mimic_scatter,avx2_stream")
+    ap.add_argument("--kernels", default="std_move,avx2,avx512,stream")
     ap.add_argument("--csv-name", default="grid_results.csv")
     args, rest = ap.parse_known_args()
     
